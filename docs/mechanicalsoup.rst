@@ -27,6 +27,17 @@ Form
     :undoc-members:
     :special-members: __setitem__
 
+Page history
+------------
+
+.. autoclass:: PageHistory
+    :members:
+    :undoc-members:
+
+.. autoclass:: HistoryEntry
+    :members:
+    :undoc-members:
+
 Exceptions
 ----------
 .. autoexception:: LinkNotFoundError

@@ -16,6 +16,19 @@ Version 1.5 (in development)
 * ``StatefulBrowser.links`` now raises an explanatory ``AttributeError`` when
   no page is loaded, instead of failing inside BeautifulSoup.
 
+* ``StatefulBrowser`` now keeps a bounded back/forward history. Successful
+  top-level navigations (``open``, ``follow_link`` and state-updating
+  ``submit_selected``) store a snapshot of the final URL, the parsed page and
+  the selected form. ``back``/``forward`` restore these snapshots without any
+  network access, so the original request (including a POST) is never
+  re-sent, while the requests session and its cookies are left untouched.
+  Capacity is limited both by page count (``history_max_pages``) and by the
+  total size of the original response bodies in bytes
+  (``history_max_bytes``); a single page over the byte budget is not stored
+  although the navigation still succeeds. Navigating again after going back
+  discards the forward branch, and request or parsing failures never add an
+  entry.
+
 Version 1.4
 ===========
 

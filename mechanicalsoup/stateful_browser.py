@@ -8,6 +8,7 @@ import requests
 
 from .browser import Browser, ResponseWithSoup
 from .form import Form
+from .history import PageHistory
 from .utils import LinkNotFoundError
 
 from requests.structures import CaseInsensitiveDict
@@ -50,6 +51,12 @@ class StatefulBrowser(Browser):
     :param raise_on_404: If True, raise :class:`LinkNotFoundError`
         when visiting a page triggers a 404 Not Found error.
     :param user_agent: Set the user agent header to this value.
+    :param history_max_pages: Maximum number of pages retained by the
+        back/forward history. ``None`` disables the page-count limit.
+    :param history_max_bytes: Maximum total size in bytes of the original
+        response bodies accounted for by the back/forward history. ``None``
+        disables the byte limit. A single page larger than this limit is
+        never stored (the navigation itself still succeeds).
 
     All arguments are forwarded to :func:`Browser`.
 
@@ -68,11 +75,14 @@ class StatefulBrowser(Browser):
     using :func:`~Browser.close`.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, history_max_pages=10,
+                 history_max_bytes=2 * 1024 * 1024, **kwargs):
         super().__init__(*args, **kwargs)
         self.__debug = False
         self.__verbose = 0
         self.__state = _BrowserState()
+        self.__history = PageHistory(
+            max_pages=history_max_pages, max_bytes=history_max_bytes)
 
         # Aliases for backwards compatibility
         # (Included specifically in __init__ to suppress them in Sphinx docs)
@@ -81,6 +91,117 @@ class StatefulBrowser(Browser):
         # form was selected for backward compatibility.
         self.get_current_form = lambda: self.__state.form
         self.get_url = lambda: self.url
+
+    @property
+    def history(self):
+        """The :class:`~mechanicalsoup.history.PageHistory` backing the
+        :meth:`back` and :meth:`forward` navigation."""
+        return self.__history
+
+    @property
+    def can_go_back(self):
+        """Whether :meth:`back` has a saved page to restore."""
+        return self.__history.can_go_back
+
+    @property
+    def can_go_forward(self):
+        """Whether :meth:`forward` has a saved page to restore."""
+        return self.__history.can_go_forward
+
+    def _body_size(self, response):
+        """Best-effort size of the original response body in bytes."""
+        try:
+            return len(response.content)
+        except Exception:
+            return 0
+
+    def _commit_navigation(self, response, replace=False):
+        """Update the current state from ``response`` and record a snapshot
+        in the history.
+
+        Only successfully parsed top-level navigations reach this method, so
+        request exceptions and parse failures never create history entries.
+        Nothing from the response's request is retained, hence going back
+        can never re-send a POST.
+        """
+        if not replace:
+            # Persist edits performed on the current page before navigating
+            # away (and possibly truncating the forward branch).
+            self.__history.update_current(
+                self.__state.page, self.__state.form)
+        self.__state = _BrowserState(page=response.soup, url=response.url,
+                                     request=response.request)
+        body_size = self._body_size(response)
+        if response.soup is None:
+            # A non-HTML response has no page to restore later: it updates the
+            # live state like before but is not part of the page history.
+            self.__history.mark_live_detached()
+            return
+        if replace:
+            self.__history.replace_current(
+                response.url, response.soup, self.__state.form, body_size)
+        else:
+            self.__history.push(
+                response.url, response.soup, self.__state.form, body_size)
+
+    def _restore_entry(self, entry):
+        """Restore a history snapshot without any network access.
+
+        The entry holds independent deep copies, which are copied again so
+        that editing the restored form cannot mutate the stored snapshot.
+        """
+        page, form = self.__history.snapshot_state(entry.page, entry.form)
+        self.__state = _BrowserState(page=page, url=entry.url, form=form)
+
+    def back(self, steps=1):
+        """Go back one or more steps in the navigation history.
+
+        The page, URL and selected form are restored from the saved
+        snapshot; no HTTP request is performed, so the original request
+        (including a POST) is never re-sent. The requests session and its
+        cookies are not modified.
+
+        If the current live page was not stored (for example its body was
+        larger than ``history_max_bytes``), the first call restores the most
+        recent saved entry without counting it as an extra step.
+
+        :param steps: Number of entries to move back.
+        :raise IndexError: if the history does not contain that many
+            entries before the current one.
+        """
+        if not self.__history.live_in_history:
+            entry = self.__history.restore_current()
+            if steps > 1:
+                entry = self.__history.back(steps - 1)
+        else:
+            entry = self.__history.back(steps)
+        self._restore_entry(entry)
+
+    def forward(self, steps=1):
+        """Go forward one or more steps in the navigation history.
+
+        See :meth:`back` for the restoration semantics: snapshots are
+        restored locally without touching the network or the session.
+
+        :param steps: Number of entries to move forward.
+        :raise IndexError: if no forward entry is available.
+        """
+        self._restore_entry(self.__history.forward(steps))
+
+    def clear_history(self):
+        """Remove every saved page, releasing the stored response pages and
+        form objects. The currently displayed page is unaffected."""
+        self.__history.clear()
+
+    def close(self):
+        """Close the session and drop the page history.
+
+        Clearing the history releases the saved pages and forms; it does not
+        roll back anything in the requests session, which is closed by the
+        parent implementation.
+        """
+        self.__history.clear()
+        super().close()
 
     def set_debug(self, debug):
         """Set the debug mode (off by default).
@@ -163,8 +284,7 @@ class StatefulBrowser(Browser):
             print(url)
 
         resp = self.get(url, *args, **kwargs)
-        self.__state = _BrowserState(page=resp.soup, url=resp.url,
-                                     request=resp.request)
+        self._commit_navigation(resp)
         return resp
 
     def open_fake_page(self, page_text, url=None, soup_config=None):
@@ -202,8 +322,7 @@ class StatefulBrowser(Browser):
 
         resp = self.session.send(old_request)
         resp = Browser.add_soup(resp, self.soup_config)
-        self.__state = _BrowserState(page=resp.soup, url=resp.url,
-                                     request=resp.request)
+        self._commit_navigation(resp, replace=True)
         return resp
 
     def select_form(self, selector="form", nr=0):
@@ -321,8 +440,7 @@ class StatefulBrowser(Browser):
             **kwargs,
         )
         if update_state:
-            self.__state = _BrowserState(page=resp.soup, url=resp.url,
-                                         request=resp.request)
+            self._commit_navigation(resp)
         return resp
 
     def list_links(self, *args, **kwargs):
