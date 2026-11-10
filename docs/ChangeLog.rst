@@ -16,6 +16,15 @@ Version 1.5 (in development)
 * ``StatefulBrowser.links`` now raises an explanatory ``AttributeError`` when
   no page is loaded, instead of failing inside BeautifulSoup.
 
+* Forms can now be selected in a stateful mode
+  (``select_form(..., stateful=True)`` or ``Form(tag, stateful=True)``) that
+  keeps each control's default and current value separate. Edited controls
+  are tracked as dirty, ``Form.update_defaults`` changes the defaults (dirty
+  controls keep their edit, clean ones follow), ``Form.sync_defaults`` adopts
+  the current DOM after external BeautifulSoup edits, and ``Form.reset``
+  restores the defaults in-memory without re-requesting the page. The default
+  mode is unchanged and keeps mutating the BeautifulSoup tags in place.
+
 Version 1.4
 ===========
 

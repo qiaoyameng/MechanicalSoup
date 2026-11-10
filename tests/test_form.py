@@ -548,5 +548,286 @@ def test_option_without_value(fail, selected, expected_post):
         assert res.status_code == 200 and res.text == 'Success!'
 
 
+# ---------------------------------------------------------------------------
+# Stateful forms: separate default/current values, dirty tracking and reset.
+# ---------------------------------------------------------------------------
+
+stateful_form_html = '''
+<html>
+  <form method="post" action="mock://form.com/post">
+    <input type="text" name="text" value="text-default" />
+    <input type="text" name="blank" />
+    <input type="checkbox" name="cb" value="a" checked="checked" />
+    <input type="checkbox" name="cb" value="b" />
+    <input type="radio" name="radio" value="x" checked="checked" />
+    <input type="radio" name="radio" value="y" />
+    <textarea name="area">area-default</textarea>
+    <select name="single">
+      <option value="s1" selected="selected">one</option>
+      <option value="s2">two</option>
+    </select>
+    <select name="multi" multiple="multiple">
+      <option value="m1">m1</option>
+      <option value="m2" selected="selected">m2</option>
+      <option value="m3">m3</option>
+    </select>
+    <input type="file" name="upload" />
+    <input type="text" name="disabled-field" value="kept"
+      disabled="disabled" />
+    <input type="submit" value="Go" />
+  </form>
+</html>
+'''
+
+
+def _form_data(form):
+    """Extract the submitted data list the way Browser.submit would."""
+    kwargs = mechanicalsoup.Browser.get_request_kwargs(
+        form.form, "http://example.com/")
+    return kwargs["data"]
+
+
+def test_stateful_form_initial_defaults_match_dom():
+    form = mechanicalsoup.Form(
+        bs4.BeautifulSoup(stateful_form_html, "html.parser").form,
+        stateful=True)
+    assert form.stateful is True
+    assert form.is_dirty() is False
+    assert _form_data(form) == [
+        ('text', 'text-default'),
+        ('blank', ''),
+        ('cb', 'a'),
+        ('radio', 'x'),
+        ('area', 'area-default'),
+        ('single', 's1'),
+        ('multi', 'm2'),
+        ('upload', ''),
+    ]
+
+
+def test_stateful_two_fills_update_defaults_and_reset():
+    """Drive one form through two fills, a default update and a reset,
+    checking the actually submitted payload at every step."""
+    browser, url = setup_mock_browser(text=stateful_form_html)
+    browser.open(url)
+    form = browser.select_form("form", stateful=True)
+
+    # First set of conditions.
+    form.set("text", "first")
+    form.set("cb", ["b"])
+    form.set("radio", "y")
+    form.set("area", "first-area")
+    form.set("single", "s2")
+    form.set("multi", ["m1", "m3"])
+    assert form.is_dirty() is True
+    assert form.is_dirty("blank") is False
+    assert _form_data(form) == [
+        ('text', 'first'), ('blank', ''), ('cb', 'b'),
+        ('radio', 'y'), ('area', 'first-area'),
+        ('single', 's2'), ('multi', 'm1'), ('multi', 'm3'),
+        ('upload', ''),
+    ]
+
+    # Second set of conditions on the same form.
+    form.set("text", "second")
+    form.set("cb", ["a", "b"])
+    form.set("radio", "x")
+    assert _form_data(form) == [
+        ('text', 'second'), ('blank', ''),
+        ('cb', 'a'), ('cb', 'b'),
+        ('radio', 'x'), ('area', 'first-area'),
+        ('single', 's2'), ('multi', 'm1'), ('multi', 'm3'),
+        ('upload', ''),
+    ]
+
+    # Change defaults: dirty controls keep their edit, clean ones follow.
+    form.update_defaults({
+        "text": "new-text-default",
+        "blank": "new-blank-default",
+        "cb": ["a"],
+        "radio": "y",
+        "area": "new-area-default",
+        "single": "s1",
+        "multi": ["m2"],
+    })
+    assert form.is_dirty() is True
+    # Dirty "text" still shows the user's second edit.
+    assert form.form.find("input", {"name": "text"})["value"] == "second"
+    # Clean "blank" follows its new default immediately.
+    assert form.form.find("input", {"name": "blank"})["value"] == \
+        "new-blank-default"
+
+    # Reset restores the new defaults in-memory, without a page request.
+    form.reset()
+    assert form.is_dirty() is False
+    assert _form_data(form) == [
+        ('text', 'new-text-default'),
+        ('blank', 'new-blank-default'),
+        ('cb', 'a'),
+        ('radio', 'y'),
+        ('area', 'new-area-default'),
+        ('single', 's1'),
+        ('multi', 'm2'),
+        ('upload', ''),
+    ]
+
+
+def test_stateful_reset_clears_file_but_keeps_disabled_and_order():
+    form = mechanicalsoup.Form(
+        bs4.BeautifulSoup(stateful_form_html, "html.parser").form,
+        stateful=True)
+    order_before = [
+        tag.get("name") for tag in
+        form.form.select("input[name], textarea[name], select[name]")
+    ]
+    upload = form.form.find("input", {"name": "upload"})
+    upload["value"] = "/etc/secret"
+    form.set("text", "edited")
+
+    form.reset()
+
+    # File selection must always be cleared on reset.
+    assert upload.has_attr("value") is False
+    # The disabled attribute is untouched.
+    assert form.form.find(
+        "input", {"name": "disabled-field"}).has_attr("disabled")
+    # Control ordering is untouched.
+    order_after = [
+        tag.get("name") for tag in
+        form.form.select("input[name], textarea[name], select[name]")
+    ]
+    assert order_after == order_before
+
+
+def test_stateful_radio_exclusivity_and_multi_select_consistency():
+    """The checked/selected sets visible through the DOM (read interface)
+    and the submitted payload must never disagree, including radio
+    exclusivity and multi-select collections."""
+    form = mechanicalsoup.Form(
+        bs4.BeautifulSoup(stateful_form_html, "html.parser").form,
+        stateful=True)
+
+    form.set("radio", "y")
+    checked = [
+        tag.get("value") for tag in
+        form.form.select('input[type="radio" i][name="radio"]')
+        if tag.has_attr("checked")
+    ]
+    assert checked == ["y"]
+    assert [v for k, v in _form_data(form) if k == "radio"] == ["y"]
+
+    form.set("multi", ["m1", "m3"])
+    selected = [
+        option.get("value") for option in
+        form.form.find("select", {"name": "multi"}).find_all("option")
+        if option.has_attr("selected")
+    ]
+    assert selected == ["m1", "m3"]
+    assert [v for k, v in _form_data(form) if k == "multi"] == [
+        "m1", "m3"]
+
+    # Reset brings both back to the single original default.
+    form.reset()
+    assert [v for k, v in _form_data(form) if k == "radio"] == ["x"]
+    assert [v for k, v in _form_data(form) if k == "multi"] == ["m2"]
+
+
+def test_stateful_sync_defaults_after_external_dom_edit():
+    form = mechanicalsoup.Form(
+        bs4.BeautifulSoup(stateful_form_html, "html.parser").form,
+        stateful=True)
+    form.set("text", "user-edit")
+    assert form.is_dirty() is True
+
+    # Edit the soup directly, bypassing the Form setters.
+    form.form.find("input", {"name": "text"})["value"] = "external-edit"
+    # Without syncing, reset discards the external edit.
+    form.reset()
+    assert form.form.find("input", {"name": "text"})["value"] == \
+        "text-default"
+
+    form.form.find("input", {"name": "text"})["value"] = "external-edit"
+    form.sync_defaults()
+    assert form.is_dirty() is False
+    form.reset()
+    assert form.form.find("input", {"name": "text"})["value"] == \
+        "external-edit"
+
+
+def test_stateful_sync_defaults_registers_externally_added_controls():
+    form = mechanicalsoup.Form(
+        bs4.BeautifulSoup('<form><input name="x" value="1"></form>',
+                          "html.parser").form,
+        stateful=True)
+    soup = bs4.BeautifulSoup("", "html.parser")
+    new_input = soup.new_tag("input")
+    new_input["name"] = "y"
+    new_input["value"] = "y0"
+    form.form.append(new_input)
+
+    form.sync_defaults()
+    assert form.is_dirty() is False
+
+    form.set("y", "changed")
+    assert form.form.find("input", {"name": "y"})["value"] == "changed"
+    form.reset()
+    assert form.form.find("input", {"name": "y"})["value"] == "y0"
+
+
+def test_stateful_submit_uses_current_state():
+    # Note: requests drops entries whose value is an empty string, so the
+    # blank text input and the cleared file input are not transmitted.
+    expected_post = [
+        ('text', 'submitted'),
+        ('cb', 'b'),
+        ('radio', 'y'),
+        ('area', 'submitted-area'),
+        ('single', 's2'),
+        ('multi', 'm1'), ('multi', 'm3'),
+    ]
+    browser, url = setup_mock_browser(
+        expected_post=expected_post, text=stateful_form_html)
+    browser.open(url)
+    form = browser.select_form("form", stateful=True)
+    form.set("text", "submitted")
+    form.set("cb", ["b"])
+    form.set("radio", "y")
+    form.set("area", "submitted-area")
+    form.set("single", "s2")
+    form.set("multi", ["m1", "m3"])
+    response = browser.submit_selected()
+    assert response.status_code == 200 and response.text == 'Success!'
+
+
+def test_non_stateful_form_keeps_dom_mutation_behavior():
+    soup = bs4.BeautifulSoup(stateful_form_html, "html.parser")
+    form = mechanicalsoup.Form(soup.form)
+    assert form.stateful is False
+    form.set("text", "in-place")
+    # Historical behavior: the DOM tag itself is mutated.
+    assert soup.form.find("input", {"name": "text"})["value"] == "in-place"
+    # State-management APIs are unavailable in default mode.
+    with pytest.raises(RuntimeError):
+        form.reset()
+    with pytest.raises(RuntimeError):
+        form.update_defaults({"text": "x"})
+    with pytest.raises(RuntimeError):
+        form.sync_defaults()
+    with pytest.raises(RuntimeError):
+        form.is_dirty()
+
+
+def test_stateful_update_defaults_unknown_choice_raises():
+    form = mechanicalsoup.Form(
+        bs4.BeautifulSoup(stateful_form_html, "html.parser").form,
+        stateful=True)
+    form.set("radio", "y")  # make it dirty
+    with pytest.raises(mechanicalsoup.LinkNotFoundError):
+        form.update_defaults({"radio": "no-such-choice"})
+    # The current edit is untouched after the failed update.
+    assert form.form.find(
+        "input", {"value": "y"}).has_attr("checked")
+
+
 if __name__ == '__main__':
     pytest.main(sys.argv)

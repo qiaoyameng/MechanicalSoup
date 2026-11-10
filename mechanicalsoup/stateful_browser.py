@@ -206,7 +206,7 @@ class StatefulBrowser(Browser):
                                      request=resp.request)
         return resp
 
-    def select_form(self, selector="form", nr=0):
+    def select_form(self, selector="form", nr=0, stateful=False):
         """Select a form in the current page.
 
         :param selector: CSS selector or a bs4.element.Tag object to identify
@@ -220,6 +220,13 @@ class StatefulBrowser(Browser):
             have the same attributes as the form you want to select, and its
             position on the page is the only way to uniquely identify it.
             Default is the first matching form (``nr=0``).
+
+        :param stateful: If True, the returned :class:`Form` keeps separate
+            default and current values, enabling
+            :func:`Form.reset`, :func:`Form.update_defaults` and
+            :func:`Form.sync_defaults` without re-requesting the page.
+            If False (default), setting a field keeps the historical behavior
+            of mutating the BeautifulSoup tag in place.
 
         :return: The selected form as a soup object. It can also be
             retrieved later with the :attr:`form` attribute.
@@ -268,7 +275,7 @@ class StatefulBrowser(Browser):
             new_elements = find_associated_elements(form.get("id"), self.page)
             form.extend(new_elements)
 
-        self.__state.form = Form(form)
+        self.__state.form = Form(form, stateful=stateful)
 
         return self.form
 

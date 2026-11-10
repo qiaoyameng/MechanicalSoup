@@ -195,6 +195,77 @@ To sum up, here is the complete example (`examples/expl_httpbin.py
 
 .. literalinclude:: ../examples/expl_httpbin.py
 
+Reusing a form: stateful mode, defaults and reset
+-------------------------------------------------
+
+By default, filling a field mutates the corresponding BeautifulSoup tag
+in place: assigning a new ``value`` overwrites the attribute that held
+the page's original value, so the initial value is lost. This is fine
+for filling a form once, but it gets in the way when the same form has
+to be filled several times with different sets of conditions and then
+restored.
+
+Passing ``stateful=True`` to
+:func:`~mechanicalsoup.StatefulBrowser.select_form` (or constructing a
+:class:`~mechanicalsoup.Form` directly with ``Form(tag, stateful=True)``)
+switches the form to *stateful mode*. It then keeps two values for every
+control:
+
+* the **current** value, which is what the ``set_*`` methods, the read
+  interface and the final request preparation all use;
+* the **default** value, a snapshot of the control when the form was
+  selected (or the last explicit default update).
+
+Each control edited through a ``set_*`` method (or ``browser["name"] =
+...``) is flagged *dirty*. The same form can then be filled repeatedly,
+and :func:`~mechanicalsoup.Form.reset` restores the current defaults
+purely from memory, without re-requesting the page::
+
+  >>> browser.select_form('form[action="/post"]', stateful=True)
+  >>> browser["custname"] = "First attempt"
+  >>> browser.form.is_dirty()
+  True
+  >>> browser["custname"] = "Second attempt"
+  >>> browser.form.reset()
+  >>> browser.form.is_dirty()
+  False
+
+Reset follows the HTML control rules: text inputs and textareas regain
+their default text, checkboxes/radios their default checked set, and
+single/multiple ``<select>`` elements their default selection. File
+inputs are always cleared (a browser cannot pre-select a file), while
+the ``disabled`` attribute and the order of controls are never touched.
+
+The defaults themselves can be changed explicitly with
+:func:`~mechanicalsoup.Form.update_defaults`, which accepts the same
+value conventions as the setters. A control that has not been edited
+follows the new default immediately; a dirty control keeps its edit and
+only adopts the new default on the next reset::
+
+  >>> browser["comments"] = "work in progress"
+  >>> browser.form.update_defaults({
+  ...     "custname": "default customer",
+  ...     "comments": "default comment",
+  ... })
+  >>> # "comments" is dirty: the edit is preserved until reset().
+
+Calling :func:`~mechanicalsoup.Form.update_defaults` with no argument (or
+:func:`~mechanicalsoup.Form.sync_defaults`) takes the current DOM values
+as the new baseline and clears every dirty flag.
+
+Modifying the BeautifulSoup tags directly
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The state layer only observes changes made through the form's ``set_*``
+methods. If you edit the underlying tags yourself (for example
+``browser.form.form.find("input", {"name": "custname"})["value"] =
+"x"``), the state layer is not aware of it and a reset would overwrite
+your edit. After such direct DOM modifications, call
+:func:`~mechanicalsoup.Form.sync_defaults` to adopt the current DOM as
+the new default baseline. Alternatively, construct the
+:class:`~mechanicalsoup.Form` only after the external edits, so they are
+captured as the initial defaults.
+
 .. _requests: http://docs.python-requests.org/en/master/
 .. _requests.Response: http://docs.python-requests.org/en/master/api/#requests.Response
 .. _bs4.BeautifulSoup: https://www.crummy.com/software/BeautifulSoup/bs4/doc/#beautifulsoup
