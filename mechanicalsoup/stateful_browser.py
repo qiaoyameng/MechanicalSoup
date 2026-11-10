@@ -7,7 +7,7 @@ import bs4
 import requests
 
 from .browser import Browser, ResponseWithSoup
-from .form import Form
+from .form import DEFAULT_FORM_ENCODING, Form
 from .utils import LinkNotFoundError
 
 from requests.structures import CaseInsensitiveDict
@@ -296,6 +296,7 @@ class StatefulBrowser(Browser):
         self,
         btnName=None,
         update_state=True,
+        form_encoding=DEFAULT_FORM_ENCODING,
         **kwargs,
     ) -> ResponseWithSoup:
         """Submit the form that was selected with :func:`select_form`.
@@ -310,6 +311,12 @@ class StatefulBrowser(Browser):
             browser state will remain unchanged; this is useful for forms that
             result in a download of a file, for example.
 
+        :param form_encoding: Encoding used for the submitted field names and
+            values. Defaults to UTF-8. Pass
+            :data:`mechanicalsoup.form.ACCEPT_CHARSET` to select the first
+            supported encoding of the form's accept-charset attribute. The
+            encoding of the response page is left untouched.
+
         All other arguments are forwarded to :func:`Browser.submit`.
         """
         kwargs = self._merge_referer(**kwargs)
@@ -318,12 +325,48 @@ class StatefulBrowser(Browser):
             form=self.form,
             url=self.url,
             btnName=btnName,
+            form_encoding=form_encoding,
             **kwargs,
         )
         if update_state:
             self.__state = _BrowserState(page=resp.soup, url=resp.url,
                                          request=resp.request)
         return resp
+
+    def prepare_selected(
+        self,
+        btnName=None,
+        form_encoding=DEFAULT_FORM_ENCODING,
+        **kwargs,
+    ) -> requests.PreparedRequest:
+        """Prepare, without sending, the request for the selected form.
+
+        The returned :class:`requests.PreparedRequest` shows the final URL,
+        headers and already-encoded body, making it possible to inspect (or
+        send manually with :func:`requests.Session.send`) the exact bytes
+        that :func:`submit_selected` would transmit.
+
+        :param btnName: Passed to :func:`Form.choose_submit` to choose the
+            submit element. Like :func:`submit_selected`, it overrides any
+            previously chosen submit when not ``None``.
+        :param form_encoding: Encoding of the submitted field names and
+            values. Defaults to UTF-8; use
+            :data:`mechanicalsoup.form.ACCEPT_CHARSET` to honor the form's
+            accept-charset attribute.
+        """
+        form = self.form
+        submit = form.submit_chosen
+        if (submit is None) or (btnName is not None):
+            submit = form.choose_submit(btnName)
+        kwargs = self._merge_referer(**kwargs)
+        return Browser.prepare_request(
+            self,
+            form=form.form,
+            url=self.url,
+            submit=submit,
+            form_encoding=form_encoding,
+            **kwargs,
+        )
 
     def list_links(self, *args, **kwargs):
         """Display the list of links in the current page. Arguments are

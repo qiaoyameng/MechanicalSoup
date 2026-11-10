@@ -5,6 +5,23 @@ Release Notes
 Version 1.5 (in development)
 ============================
 
+* Form submissions gained an explicit ``form_encoding`` option on
+  ``Browser.submit``, ``Browser.prepare_request``,
+  ``StatefulBrowser.submit_selected`` and
+  ``StatefulBrowser.prepare_selected``. It defaults to UTF-8, so existing
+  behavior is unchanged; pass ``mechanicalsoup.form.ACCEPT_CHARSET`` to use
+  the first supported encoding declared in the form's ``accept-charset``
+  attribute (for example Shift_JIS). Field names and values are encoded
+  after the successful controls are collected, characters the target codec
+  cannot represent become HTML numeric character references (``&#NNNN;``),
+  and an existing hidden ``_charset_`` field reports the encoding actually
+  used. Percent-escaping of ``application/x-www-form-urlencoded`` data is
+  applied to the encoded bytes, identically for GET queries and POST
+  bodies, while multipart text parts are encoded separately from the raw
+  file contents. ``prepare_request`` / ``prepare_selected`` return the
+  final ``requests.PreparedRequest`` without sending it. The encoding used
+  to decode response pages is unchanged.
+
 * When the ``Content-Type`` header is missing, HTML is now detected from the
   first bytes of the response instead of decoding the whole body, which is
   much faster for large binary responses. Uppercase markup such as ``<HTML>``

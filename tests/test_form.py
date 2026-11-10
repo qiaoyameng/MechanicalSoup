@@ -1,5 +1,7 @@
 import sys
 
+from urllib.parse import urlsplit
+
 import bs4
 import pytest
 import setpath  # noqa:F401, must come before 'import mechanicalsoup'
@@ -203,7 +205,12 @@ def test_form_noaction():
     form = browser.select_form('#choose-submit-form')
     form['text1'] = 'newText1'
     res = browser.submit_selected()
-    assert res.status_code == 200 and browser.url == url
+    assert res.status_code == 200
+    submitted = urlsplit(browser.url)
+    assert submitted.scheme + "://" + submitted.netloc == url
+    # A GET form carries its successful controls in the query string, in
+    # submission order.
+    assert submitted.query == "text1=newText1&text2=someValue2&save="
 
 
 submit_form_action = '''
@@ -227,7 +234,10 @@ def test_form_action():
     form = browser.select_form('#choose-submit-form')
     form['text1'] = 'newText1'
     res = browser.submit_selected()
-    assert res.status_code == 200 and browser.url == url
+    assert res.status_code == 200
+    submitted = urlsplit(browser.url)
+    assert submitted.scheme + "://" + submitted.netloc == url
+    assert submitted.query == "text1=newText1&text2=someValue2&save="
 
 
 set_select_form = '''

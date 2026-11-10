@@ -1,8 +1,10 @@
 import io
 import os
 import re
+import binascii
 import tempfile
-from typing import cast
+from collections.abc import Mapping
+from typing import Any, cast
 import urllib.parse
 import weakref
 import webbrowser
@@ -12,8 +14,21 @@ import bs4.dammit
 import requests
 
 from .__version__ import __title__, __version__
-from .form import Form
+from .form import (
+    CHARSET_FIELD_NAME,
+    DEFAULT_FORM_ENCODING,
+    Form,
+    encode_form_text,
+    resolve_form_encoding,
+)
 from .utils import LinkNotFoundError, is_disabled, is_multipart_file_upload
+
+
+# A collected form control is represented as a tagged tuple:
+# ("text", name, value) for a regular field, ("file", name, (filename,
+# fileobj)) for a multipart file upload. The list preserves the order in
+# which successful controls appear on the page.
+FormEntry = tuple[str, str, Any]
 
 
 class ResponseWithSoup(requests.Response):
@@ -215,30 +230,38 @@ class Browser:
         return request_kwargs
 
     @classmethod
-    def get_request_kwargs(cls, form, url=None, submit=None, **kwargs):
-        """Extract input data from the form."""
-        method = str(form.get("method", "get"))
-        action = form.get("action")
+    def _collect_form_entries(
+        cls,
+        form,
+        submit=None,
+        data=None,
+        files=None,
+    ) -> tuple[list[FormEntry], bool]:
+        """Collect the form's successful controls in submission order.
 
-        # If the form has a submit button, use its form action
-        # https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/button#formaction.
-        if isinstance(submit, bs4.element.Tag) and (submit.name == "button"):
-            action = submit.get("formaction", action)
-
-        url = urllib.parse.urljoin(url, action)
-        if url is None:  # This happens when both `action` and `url` are None.
-            raise ValueError('no URL to submit to')
-
-        # read https://www.w3.org/TR/html52/sec-forms.html
-        if method.lower() == "get":
-            data = kwargs.pop("params", dict())
+        Returns a list of tagged entries and whether the form uses
+        multipart/form-data. Text fields are ``("text", name, value)``
+        triples while file uploads are ``("file", name, (filename,
+        fileobj))``. Caller-provided ``data`` and ``files`` come first,
+        matching the historical appending behavior.
+        """
+        entries: list[FormEntry] = []
+        if isinstance(data, Mapping):
+            user_text_entries = list(data.items())
         else:
-            data = kwargs.pop("data", dict())
-        files = kwargs.pop("files", dict())
-
-        # Use a list of 2-tuples to better reflect the behavior of browser QSL.
-        # Requests also retains order when encoding form data in 2-tuple lists.
-        data = [(k, v) for k, v in data.items()]
+            user_text_entries = list(data or ())
+        for name, value in user_text_entries:
+            entries.append(("text", name, value))
+        if isinstance(files, Mapping):
+            user_file_entries = list(files.items())
+        else:
+            user_file_entries = list(files or ())
+        for name, value in user_file_entries:
+            # Accept the same (filename, fileobj) shape used by requests.
+            if isinstance(value, (tuple, list)):
+                entries.append(("file", name, tuple(value[:2])))
+            else:
+                entries.append(("file", name, ("", value)))
 
         multipart = form.get("enctype", "") == "multipart/form-data"
 
@@ -285,21 +308,21 @@ class Browser:
                     # If content is the empty string, we still pass it
                     # for consistency with browsers (see
                     # https://github.com/MechanicalSoup/MechanicalSoup/issues/250).
-                    files[name] = (filename, content)
+                    entries.append(("file", name, (filename, content)))
                 else:
                     if isinstance(value, io.IOBase):
                         value = os.path.basename(getattr(value, "name", ""))
-                    data.append((name, value))
+                    entries.append(("text", name, value))
 
             elif tag.name == "button":
                 # Buttons are only included if they are the selected submit
                 if submit_added or (tag != submit):
                     continue
                 submit_added = True
-                data.append((name, tag.get("value", "")))
+                entries.append(("text", name, tag.get("value", "")))
 
             elif tag.name == "textarea":
-                data.append((name, tag.text))
+                entries.append(("text", name, tag.text))
 
             elif tag.name == "select":
                 # If the value attribute is not specified, the content will
@@ -309,55 +332,270 @@ class Browser:
                                    if "selected" in i.attrs]
                 if "multiple" in tag.attrs:
                     for value in selected_values:
-                        data.append((name, value))
+                        entries.append(("text", name, value))
                 elif selected_values:
                     # A standard select element only allows one option to be
                     # selected, but browsers pick last if somehow multiple.
-                    data.append((name, selected_values[-1]))
+                    entries.append(("text", name, selected_values[-1]))
                 elif options:
                     # Selects the first option if none are selected
                     first_value = options[0].get("value", options[0].text)
-                    data.append((name, first_value))
+                    entries.append(("text", name, first_value))
 
+        return entries, multipart
+
+    @staticmethod
+    def _set_charset_field(form, entries: list[FormEntry], encoding: str):
+        """Fill an existing hidden ``_charset_`` control with the encoding
+        actually used, as required by the HTML specification.
+        """
+        selector = 'input[type="hidden" i][name="{}"]'.format(
+            CHARSET_FIELD_NAME)
+        charset_input = form.select_one(selector)
+        if charset_input is None:
+            return
+        for index, entry in enumerate(entries):
+            if entry[0] == "text" and entry[1] == CHARSET_FIELD_NAME:
+                entries[index] = ("text", CHARSET_FIELD_NAME, encoding)
+
+    @staticmethod
+    def _percent_quote(raw_bytes: bytes) -> str:
+        """Percent-escape already-encoded bytes for urlencoded data.
+
+        Escaping happens after encoding, so a multibyte character produces
+        one percent sequence per byte and existing NCR/percent text is never
+        encoded a second time. Spaces become ``+`` like in a browser.
+        """
+        return urllib.parse.quote_from_bytes(raw_bytes, safe=b"").replace(
+            "%20", "+")
+
+    @staticmethod
+    def _urlencoded_pairs(
+        entries: list[FormEntry],
+        encoding: str,
+    ) -> list[tuple[str, str]]:
+        """Serialize entries as percent-escaped ASCII string pairs.
+
+        Escaping is applied after the charset encoding, so each multibyte
+        character yields one percent sequence per byte. The same pairs feed
+        both GET query strings and POST bodies, guaranteeing identical
+        encoding in both cases. Non-multipart file inputs have already been
+        reduced to their filename as a regular text value.
+        """
+        pairs = []
+        for kind, name, value in entries:
+            if kind == "file":
+                filename, _fileobj = value
+                value = filename
+            quoted_name = Browser._percent_quote(
+                encode_form_text(name, encoding))
+            quoted_value = Browser._percent_quote(
+                encode_form_text(value, encoding))
+            pairs.append((quoted_name, quoted_value))
+        return pairs
+
+    @staticmethod
+    def _encode_urlencoded(
+        entries: list[FormEntry],
+        encoding: str,
+    ) -> bytes:
+        """Serialize entries as an application/x-www-form-urlencoded body."""
+        pairs = Browser._urlencoded_pairs(entries, encoding)
+        return "&".join("=".join(pair) for pair in pairs).encode("ascii")
+
+    @staticmethod
+    def _multipart_boundary() -> str:
+        return binascii.hexlify(os.urandom(16)).decode("ascii")
+
+    @staticmethod
+    def _multipart_header_value(value: str, encoding: str) -> str:
+        """Escape a multipart header parameter (field name or filename).
+
+        The string is encoded with the submission charset first; bytes that
+        are not valid in an HTTP token (notably non-ASCII multibyte
+        characters, CR, LF and double quote) are then percent-escaped. This
+        keeps the header ASCII while preserving the chosen encoding, unlike
+        requests which always assumes UTF-8.
+        """
+        raw = encode_form_text(value, encoding)
+        escaped = bytearray()
+        for byte in raw:
+            if byte in (0x0A, 0x0D, 0x22):
+                escaped.extend(f"%{byte:02X}".encode("ascii"))
+            elif byte < 0x20 or byte > 0x7E:
+                escaped.extend(f"%{byte:02X}".encode("ascii"))
+            else:
+                escaped.append(byte)
+        return escaped.decode("ascii")
+
+    @staticmethod
+    def _encode_multipart(
+        entries: list[FormEntry],
+        encoding: str,
+    ) -> tuple[bytes, str]:
+        """Build a multipart/form-data body.
+
+        Text parts (names and values) are encoded with ``encoding`` and NCR
+        fallback; file parts keep their raw binary content untouched. Only
+        the header strings (part name, filename) of file parts are encoded.
+        """
+        boundary = Browser._multipart_boundary()
+        body = io.BytesIO()
+
+        def write_line(raw: bytes) -> None:
+            body.write(raw)
+            body.write(b"\r\n")
+
+        for kind, name, value in entries:
+            write_line(f"--{boundary}".encode("ascii"))
+            disposition = (
+                'Content-Disposition: form-data; name="'
+                + Browser._multipart_header_value(name, encoding)
+                + '"'
+            )
+            if kind == "file":
+                filename, fileobj = value
+                if filename:
+                    disposition += (
+                        '; filename="'
+                        + Browser._multipart_header_value(
+                            filename, encoding)
+                        + '"'
+                    )
+            write_line(disposition.encode("ascii"))
+            write_line(b"")
+
+            if kind == "file":
+                _filename, fileobj = value
+                if isinstance(fileobj, io.IOBase):
+                    # Read once; requests itself consumes file objects this
+                    # way when preparing a request.
+                    content = fileobj.read()
+                elif fileobj is None:
+                    content = b""
+                else:
+                    content = fileobj
+                if isinstance(content, str):
+                    content = content.encode(encoding,
+                                             errors="mechanicalsoup_ncr")
+                body.write(content)
+            else:
+                body.write(encode_form_text(value, encoding))
+            body.write(b"\r\n")
+
+        write_line(f"--{boundary}--".encode("ascii"))
+        content_type = f"multipart/form-data; boundary={boundary}"
+        return body.getvalue(), content_type
+
+    @classmethod
+    def get_request_kwargs(cls, form, url=None, submit=None,
+                           form_encoding=DEFAULT_FORM_ENCODING, **kwargs):
+        """Extract input data from the form and prepare the request kwargs.
+
+        :param form_encoding: Codec used for field names and values. Defaults
+            to UTF-8. Pass :data:`mechanicalsoup.form.ACCEPT_CHARSET` to
+            choose the first supported encoding listed in the form's
+            accept-charset attribute instead.
+        """
+        method = str(form.get("method", "get"))
+        action = form.get("action")
+
+        # If the form has a submit button, use its form action (formaction):
+        # https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/button#formaction  # noqa: E501
+        if isinstance(submit, bs4.element.Tag) and (submit.name == "button"):
+            action = submit.get("formaction", action)
+
+        url = urllib.parse.urljoin(url, action)
+        if url is None:  # This happens when both `action` and `url` are None.
+            raise ValueError('no URL to submit to')
+
+        # read https://www.w3.org/TR/html52/sec-forms.html
         if method.lower() == "get":
-            kwargs["params"] = data
+            user_data = kwargs.pop("params", dict())
         else:
-            kwargs["data"] = data
+            user_data = kwargs.pop("data", dict())
+        user_files = kwargs.pop("files", dict())
 
-        # The following part of the function is here to respect the
-        # enctype specified by the form, i.e. force sending multipart
-        # content. Since Requests doesn't have yet a feature to choose
-        # enctype, we have to use tricks to make it behave as we want
-        # This code will be updated if Requests implements it.
-        if multipart and not files:
-            # Requests will switch to "multipart/form-data" only if
-            # files pass the `if files:` test, so in this case we use
-            # a modified dict that passes the if test even if empty.
-            class DictThatReturnsTrue(dict):
-                def __bool__(self):
-                    return True
-                __nonzero__ = __bool__
+        entries, multipart = cls._collect_form_entries(
+            form, submit, user_data, user_files)
+        encoding = resolve_form_encoding(form, form_encoding)
+        cls._set_charset_field(form, entries, encoding)
 
-            files = DictThatReturnsTrue()
+        if multipart:
+            body, content_type = cls._encode_multipart(entries, encoding)
+            kwargs["data"] = body
+            cls._set_content_type(kwargs, content_type)
+        elif method.lower() == "get":
+            # Join the already percent-escaped pairs onto the URL ourselves:
+            # requests would re-escape tuple params and skips URL preparation
+            # entirely for non-HTTP schemes such as mock://. Any query
+            # already present in the action is preserved verbatim.
+            query = cls._encode_urlencoded(entries, encoding).decode("ascii")
+            if query:
+                separator = "&" if urllib.parse.urlsplit(url).query else "?"
+                url = url + separator + query
+        else:
+            kwargs["data"] = cls._encode_urlencoded(entries, encoding)
+            # We hand requests a pre-encoded bytes body, so it cannot infer
+            # the form content type on its own anymore.
+            cls._set_content_type(
+                kwargs, "application/x-www-form-urlencoded")
 
-        return cls._get_request_kwargs(method, url, files=files, **kwargs)
+        return cls._get_request_kwargs(method, url, **kwargs)
+
+    @staticmethod
+    def _set_content_type(kwargs, content_type):
+        headers = kwargs.get("headers")
+        if not headers:
+            headers = {}
+        else:
+            headers = dict(headers)
+        headers["Content-Type"] = content_type
+        kwargs["headers"] = headers
+
+    def prepare_request(
+        self,
+        form,
+        url=None,
+        submit=None,
+        form_encoding=DEFAULT_FORM_ENCODING,
+        **kwargs,
+    ) -> requests.PreparedRequest:
+        """Prepare, without sending, the request that submits ``form``.
+
+        The returned :class:`requests.PreparedRequest` is exactly what
+        :func:`submit` would send, so the final URL, headers and encoded
+        body can be inspected before any network access.
+        """
+        request_kwargs = self.get_request_kwargs(
+            form,
+            url,
+            submit,
+            form_encoding=form_encoding,
+            **kwargs,
+        )
+        return self.session.prepare_request(
+            requests.Request(**request_kwargs))
 
     def _request(
         self,
         form,
         url=None,
         submit=None,
+        form_encoding=DEFAULT_FORM_ENCODING,
         **kwargs,
     ) -> requests.Response:
         """Extract input data from the form to pass to a Requests session."""
-        request_kwargs = self.get_request_kwargs(form, url, submit, **kwargs)
-        return self.session.request(**request_kwargs)
+        prepared = self.prepare_request(
+            form, url, submit, form_encoding=form_encoding, **kwargs)
+        return self.session.send(prepared)
 
     def submit(
         self,
         form,
         url=None,
         btnName=None,
+        form_encoding=DEFAULT_FORM_ENCODING,
         **kwargs,
     ) -> ResponseWithSoup:
         """Prepares and sends a form request.
@@ -372,6 +610,10 @@ class Browser:
         :param btnName: Passed to :func:`Form.choose_submit` to choose the
             element of the form to use for submission. If not ``None``, will
             override any existing chosen submit in the form.
+        :param form_encoding: Encoding of the submitted field names and
+            values. Defaults to UTF-8; use
+            :data:`mechanicalsoup.form.ACCEPT_CHARSET` to honor the form's
+            accept-charset attribute. Response decoding is not affected.
         :param \\*\\*kwargs: Arguments forwarded to `requests.Session.request
             <http://docs.python-requests.org/en/master/api/#requests.Session.request>`__.
             If `files`, `params` (with GET), or `data` (with POST) are
@@ -387,7 +629,9 @@ class Browser:
         if (submit is None) or (btnName is not None):
             submit = form.choose_submit(btnName)
 
-        response = self._request(form.form, url, submit, **kwargs)
+        response = self._request(
+            form.form, url, submit,
+            form_encoding=form_encoding, **kwargs)
         return Browser.add_soup(response, self.soup_config)
 
     def launch_browser(self, soup):

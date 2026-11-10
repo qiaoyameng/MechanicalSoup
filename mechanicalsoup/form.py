@@ -1,12 +1,109 @@
 from collections.abc import Mapping
+import codecs
 import copy
 import io
+import re
 from typing import Any, Literal
 import warnings
 
 import bs4
 
 from .utils import LinkNotFoundError, is_multipart_file_upload
+
+
+# Default encoding used to build form submission requests. This only affects
+# outgoing requests; response decoding is unchanged and still follows the
+# browser behavior implemented in Browser.add_soup.
+DEFAULT_FORM_ENCODING = "utf-8"
+
+# Sentinel value for Browser.get_request_kwargs (and the submit methods):
+# select the encoding from the form's accept-charset attribute instead of
+# using an explicitly provided one.
+ACCEPT_CHARSET = "accept-charset"
+
+# HTML name of the hidden field that carries the encoding actually used.
+CHARSET_FIELD_NAME = "_charset_"
+
+
+def _ncr_error_handler(error: UnicodeError) -> tuple[str, int]:
+    """Codec error handler replacing unencodable characters with HTML
+    numeric character references.
+
+    Every character of the offending run is replaced by ``&#NNNN;``, where
+    ``NNNN`` is the Unicode code point written in decimal, as done by browsers
+    for the ``_charset_``/accept-charset mechanism. The replacement only
+    contains ASCII characters and can therefore be encoded by every codec.
+    """
+    if not isinstance(error, UnicodeEncodeError):
+        raise error
+    replacement = "".join(f"&#{ord(char)};" for char in error.object[
+        error.start:error.end])
+    return replacement, error.end
+
+
+codecs.register_error("mechanicalsoup_ncr", _ncr_error_handler)
+
+
+def encode_form_text(text: str, encoding: str) -> bytes:
+    """Encode a form field name or value for submission.
+
+    Characters that cannot be represented in ``encoding`` are replaced by
+    HTML numeric character references (e.g. ``&#27085;``) before encoding,
+    so the server can recover the original Unicode character after decoding
+    the request. No Unicode normalization is performed.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    return text.encode(encoding, errors="mechanicalsoup_ncr")
+
+
+def _supported_encodings(accept_charset: str) -> list[str]:
+    """Parse an accept-charset attribute and keep the encodings Python
+    supports, in declaration order and without duplicates.
+    """
+    supported: list[str] = []
+    # The HTML syntax separates encodings with spaces and/or commas; some
+    # parsers additionally expose space-separated values as a list, so the
+    # caller normalizes the attribute to a string first.
+    for label in re.split(r"[\s,]+", accept_charset):
+        label = label.strip().lower()
+        if not label:
+            continue
+        try:
+            canonical = codecs.lookup(label).name
+        except LookupError:
+            continue
+        if canonical not in supported:
+            supported.append(canonical)
+    return supported
+
+
+def resolve_form_encoding(
+    form: bs4.element.Tag,
+    form_encoding: str | None = DEFAULT_FORM_ENCODING,
+) -> str:
+    """Return the encoding to use when submitting ``form``.
+
+    :param form_encoding: Explicit codec name, or
+        :data:`ACCEPT_CHARSET` to pick the first supported encoding of the
+        form's accept-charset attribute. ``None`` keeps the UTF-8 default.
+
+    With :data:`ACCEPT_CHARSET`, encodings the local Python build does not
+    know are ignored, mirroring a browser that does not support them. If no
+    declared encoding is supported (or the attribute is absent), UTF-8 is
+    used.
+    """
+    if form_encoding is None:
+        return DEFAULT_FORM_ENCODING
+    if form_encoding.lower() == ACCEPT_CHARSET:
+        accept_charset = form.get("accept-charset", "")
+        if not isinstance(accept_charset, str):
+            accept_charset = " ".join(str(part) for part in accept_charset)
+        supported = _supported_encodings(accept_charset)
+        if supported:
+            return supported[0]
+        return DEFAULT_FORM_ENCODING
+    return codecs.lookup(form_encoding).name
 
 
 class InvalidFormMethod(LinkNotFoundError):

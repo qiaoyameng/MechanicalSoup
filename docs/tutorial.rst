@@ -190,6 +190,48 @@ BeautifulSoup object, but we can still see the text it contains::
     },
   ...
 
+Choosing the submission encoding
+--------------------------------
+
+MechanicalSoup encodes form data as UTF-8 by default, just like modern
+browsers and the requests_ library. Some legacy sites still require a
+legacy codec such as Shift_JIS and reject UTF-8 input. The
+``form_encoding`` argument of :func:`~StatefulBrowser.submit_selected`
+sets the codec used for the submitted field names and values::
+
+  >>> response = browser.submit_selected(form_encoding="shift_jis")
+
+Characters that the chosen codec cannot represent (for example an emoji
+in a Shift_JIS form) are replaced by HTML numeric character references
+such as ``&#128512;`` instead of being lost. If the form advertises the
+acceptable codecs through its ``accept-charset`` attribute, pass
+``mechanicalsoup.form.ACCEPT_CHARSET`` to pick the first supported one,
+falling back to UTF-8 when none is supported::
+
+  >>> import mechanicalsoup
+  >>> response = browser.submit_selected(
+  ...     form_encoding=mechanicalsoup.form.ACCEPT_CHARSET)
+
+When the form contains a hidden ``_charset_`` field, MechanicalSoup
+fills it with the encoding actually used. The encoding only affects the
+request: decoding of the response page still follows the regular browser
+rules and is never silently switched to the submission encoding.
+
+The same rules apply to GET queries and POST bodies, and the query
+string already present in the form's ``action`` is preserved verbatim.
+For ``multipart/form-data`` uploads, text fields follow
+``form_encoding`` while the uploaded file bytes are sent untouched.
+
+To inspect the exact request before transmitting it, prepare it without
+sending and read the resulting `requests.PreparedRequest
+<http://docs.python-requests.org/en/master/api/#requests.PreparedRequest>`__,
+which exposes the final URL, headers and encoded body::
+
+  >>> prepared = browser.prepare_selected(form_encoding="shift_jis")
+  >>> prepared.url
+  >>> prepared.body
+  >>> response = browser.session.send(prepared)
+
 To sum up, here is the complete example (`examples/expl_httpbin.py
 <https://github.com/MechanicalSoup/MechanicalSoup/blob/main/examples/expl_httpbin.py>`__):
 
