@@ -310,7 +310,9 @@ class StatefulBrowser(Browser):
             browser state will remain unchanged; this is useful for forms that
             result in a download of a file, for example.
 
-        All other arguments are forwarded to :func:`Browser.submit`.
+        All other arguments are forwarded to :func:`Browser.submit`,
+        including ``validate`` to enable opt-in constraint validation
+        before the request is sent.
         """
         kwargs = self._merge_referer(**kwargs)
         resp = Browser.submit(

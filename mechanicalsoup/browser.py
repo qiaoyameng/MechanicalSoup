@@ -14,6 +14,7 @@ import requests
 from .__version__ import __title__, __version__
 from .form import Form
 from .utils import LinkNotFoundError, is_disabled, is_multipart_file_upload
+from .validation import FormValidationError
 
 
 class ResponseWithSoup(requests.Response):
@@ -358,6 +359,7 @@ class Browser:
         form,
         url=None,
         btnName=None,
+        validate=False,
         **kwargs,
     ) -> ResponseWithSoup:
         """Prepares and sends a form request.
@@ -372,6 +374,12 @@ class Browser:
         :param btnName: Passed to :func:`Form.choose_submit` to choose the
             element of the form to use for submission. If not ``None``, will
             override any existing chosen submit in the form.
+        :param validate: If True, run opt-in constraint validation
+            (:func:`Form.validate`) before sending. If any control is
+            invalid, raise :class:`FormValidationError` carrying all
+            violations and do not send any request. Defaults to False,
+            which preserves the historical behavior of submitting without
+            validation.
         :param \\*\\*kwargs: Arguments forwarded to `requests.Session.request
             <http://docs.python-requests.org/en/master/api/#requests.Session.request>`__.
             If `files`, `params` (with GET), or `data` (with POST) are
@@ -386,6 +394,11 @@ class Browser:
         submit = form.submit_chosen
         if (submit is None) or (btnName is not None):
             submit = form.choose_submit(btnName)
+
+        if validate:
+            violations = form.validate(submit)
+            if violations:
+                raise FormValidationError(violations)
 
         response = self._request(form.form, url, submit, **kwargs)
         return Browser.add_soup(response, self.soup_config)

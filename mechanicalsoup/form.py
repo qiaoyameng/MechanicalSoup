@@ -7,6 +7,7 @@ import warnings
 import bs4
 
 from .utils import LinkNotFoundError, is_multipart_file_upload
+from .validation import ConstraintViolation, validate_form
 
 
 class InvalidFormMethod(LinkNotFoundError):
@@ -390,6 +391,35 @@ class Form:
         self._submit_chosen = submit_chosen
 
         return self._submit_chosen
+
+    def validate(
+        self,
+        submit: bs4.element.Tag | Literal[False] | None = None,
+    ) -> list[ConstraintViolation]:
+        """Validate the form's controls against their HTML constraints.
+
+        This is an opt-in check: it is never performed implicitly. It
+        does not modify the DOM and does not send any request.
+
+        :param submit: The submit element to use for submission. If
+            ``None`` (default), the element previously selected with
+            :func:`choose_submit` is used. If the element has a
+            ``formnovalidate`` attribute, or if the form has a
+            ``novalidate`` attribute, no validation is performed (the
+            submitter's ``formnovalidate`` takes precedence).
+
+        :return: A list of :class:`ConstraintViolation`, in document
+            order, identifying each invalid control, the violated
+            constraint and the actual value. Empty if the form is valid.
+
+        See :mod:`mechanicalsoup.validation` for the constraints covered
+        by this first version and the input types that are not checked.
+        """
+        if submit is None:
+            submit = self._submit_chosen
+        if submit is False:
+            submit = None
+        return validate_form(self.form, submit)
 
     def print_summary(self) -> None:
         """Print a summary of the form.

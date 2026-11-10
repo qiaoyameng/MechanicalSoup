@@ -33,3 +33,12 @@ Exceptions
     :show-inheritance:
 .. autoexception:: InvalidFormMethod
     :show-inheritance:
+.. autoexception:: FormValidationError
+    :show-inheritance:
+
+Constraint validation
+---------------------
+.. automodule:: mechanicalsoup.validation
+    :members:
+.. autoclass:: ConstraintViolation
+    :members:

@@ -5,6 +5,20 @@ Release Notes
 Version 1.5 (in development)
 ============================
 
+* Added opt-in form constraint validation. ``Form.validate()`` reports
+  all constraint violations (control identity, constraint and actual
+  value, in document order) without modifying the DOM or sending a
+  request, and ``Browser.submit(..., validate=True)`` (also available
+  via ``StatefulBrowser.submit_selected``) raises
+  ``FormValidationError`` before any request is sent when the form is
+  invalid. This first version covers ``required``, ``minlength`` /
+  ``maxlength``, ``min`` / ``max`` / ``step`` for ``number`` and
+  ``date`` inputs, and the required semantics of radio buttons,
+  checkboxes and selects. Disabled (including the disabled ``<fieldset>``
+  rule) and ``readonly`` controls are never reported, and the form's
+  ``novalidate`` / submitter's ``formnovalidate`` attributes are
+  honored. Step arithmetic is exact (no binary floating-point modulo).
+
 * When the ``Content-Type`` header is missing, HTML is now detected from the
   first bytes of the response instead of decoding the whole body, which is
   much faster for large binary responses. Uppercase markup such as ``<HTML>``

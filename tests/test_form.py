@@ -3,7 +3,7 @@ import sys
 import bs4
 import pytest
 import setpath  # noqa:F401, must come before 'import mechanicalsoup'
-from utils import setup_mock_browser
+from utils import mock_get, mock_post, prepare_mock_browser, setup_mock_browser
 
 import mechanicalsoup
 
@@ -546,6 +546,255 @@ def test_option_without_value(fail, selected, expected_post):
 
         res = browser.submit_selected()
         assert res.status_code == 200 and res.text == 'Success!'
+
+
+validate_form_html = """
+<html>
+  <body>
+    <form method="post" action="mock://form.com/post">
+      <input type="radio" name="size" value="small" required>
+      <input type="radio" name="size" value="large">
+      <fieldset disabled>
+        <legend><input type="text" name="legend_note" required></legend>
+        <input type="text" name="locked" required>
+        <input type="number" name="locked_num" required>
+      </fieldset>
+      <input type="number" name="quantity" min="0" max="10" step="0.1">
+      <input type="text" name="readonly_note" required readonly>
+      <input type="submit" name="save" value="Save">
+    </form>
+  </body>
+</html>
+"""
+
+
+def parse_form(text=validate_form_html):
+    soup = bs4.BeautifulSoup(text, 'lxml')
+    return mechanicalsoup.Form(soup.form)
+
+
+def test_validate_radio_group_required():
+    """A required radio group with nothing checked is reported once,
+    identified by the first required member of the group."""
+    form = parse_form()
+    violations = form.validate()
+    radio_violations = [v for v in violations
+                        if v.control.get("name") == "size"]
+    assert len(radio_violations) == 1
+    violation = radio_violations[0]
+    assert violation.constraint == "valueMissing"
+    assert violation.value == ""
+    assert violation.control.get("value") == "small"
+    assert 'input[type="radio"][name="size"]' in str(violation)
+
+    # Checking any member of the group satisfies the constraint.
+    form.set_radio({"size": "large"})
+    assert not [v for v in form.validate()
+                if v.control.get("name") == "size"]
+
+
+def test_validate_disabled_fieldset_and_legend():
+    """Controls in a disabled fieldset are barred from validation, except
+    those inside the fieldset's first <legend>."""
+    form = parse_form()
+    violations = form.validate()
+    names = [v.control.get("name") for v in violations]
+    assert "locked" not in names
+    assert "locked_num" not in names
+    # The control in the first legend stays enabled and is required.
+    assert "legend_note" in names
+
+
+def test_validate_readonly_not_reported():
+    """Readonly controls are barred from constraint validation."""
+    form = parse_form()
+    assert "readonly_note" not in [v.control.get("name")
+                                   for v in form.validate()]
+
+
+def test_validate_document_order_and_identity():
+    """Violations are reported in document order with control identity,
+    constraint and actual value."""
+    form = parse_form()
+    violations = form.validate()
+    assert [(v.control.get("name"), v.constraint) for v in violations] == [
+        ("size", "valueMissing"),
+        ("legend_note", "valueMissing"),
+    ]
+    assert all(isinstance(v, mechanicalsoup.ConstraintViolation)
+               for v in violations)
+
+
+def test_validate_decimal_step():
+    """Step validation must not use binary float modulo: 0.3 is a
+    multiple of step 0.1, but 0.35 is not."""
+    form = parse_form()
+    form.set_input({"quantity": "0.3"})
+    assert not [v for v in form.validate()
+                if v.control.get("name") == "quantity"]
+
+    form.set_input({"quantity": "0.35"})
+    violations = [v for v in form.validate()
+                  if v.control.get("name") == "quantity"]
+    assert [v.constraint for v in violations] == ["stepMismatch"]
+    assert violations[0].value == "0.35"
+
+
+@pytest.mark.parametrize("value, constraints", [
+    pytest.param("-1", ["rangeUnderflow"], id="below min"),
+    pytest.param("11", ["rangeOverflow"], id="above max"),
+    pytest.param("5", [], id="valid"),
+    pytest.param("abc", ["typeMismatch"], id="not a number"),
+])
+def test_validate_number_min_max(value, constraints):
+    form = parse_form()
+    form.set_input({"quantity": value})
+    violations = [v for v in form.validate()
+                  if v.control.get("name") == "quantity"]
+    assert [v.constraint for v in violations] == constraints
+
+
+@pytest.mark.parametrize("value, constraints", [
+    pytest.param("2026-11-05", [], id="valid"),
+    pytest.param("2026-10-31", ["rangeUnderflow"], id="below min"),
+    pytest.param("2026-11-20", ["rangeOverflow"], id="above max"),
+    pytest.param("2026-11-06", ["stepMismatch"], id="off step"),
+    pytest.param("not-a-date", ["typeMismatch"], id="not a date"),
+])
+def test_validate_date_min_max_step(value, constraints):
+    text = """
+    <form>
+      <input type="date" name="when" min="2026-11-05" max="2026-11-15"
+             step="5">
+    </form>
+    """
+    form = parse_form(text)
+    form.set_input({"when": value})
+    assert [v.constraint for v in form.validate()] == constraints
+
+
+@pytest.mark.parametrize("value, constraints", [
+    pytest.param("", ["valueMissing"], id="empty required"),
+    pytest.param("ab", ["tooShort"], id="too short"),
+    pytest.param("abcdef", ["tooLong"], id="too long"),
+    pytest.param("abc", [], id="valid"),
+])
+def test_validate_text_length(value, constraints):
+    text = """
+    <form>
+      <input type="text" name="login" required minlength="3" maxlength="5">
+      <textarea name="bio" maxlength="3">toolong</textarea>
+    </form>
+    """
+    form = parse_form(text)
+    form.set_input({"login": value})
+    violations = form.validate()
+    assert [v.constraint for v in violations
+            if v.control.get("name") == "login"] == constraints
+    assert [v.constraint for v in violations
+            if v.control.get("name") == "bio"] == ["tooLong"]
+
+
+def test_validate_checkbox_and_select_required():
+    text = """
+    <form>
+      <input type="checkbox" name="eula" required>
+      <select name="color" required>
+        <option value="">-- pick --</option>
+        <option value="red">Red</option>
+      </select>
+      <select name="toppings" multiple required>
+        <option value="cheese">Cheese</option>
+      </select>
+    </form>
+    """
+    form = parse_form(text)
+    violations = form.validate()
+    assert [(v.control.get("name"), v.constraint) for v in violations] == [
+        ("eula", "valueMissing"),
+        ("color", "valueMissing"),
+        ("toppings", "valueMissing"),
+    ]
+
+    form.set_checkbox({"eula": True})
+    form.set_select({"color": "red", "toppings": ["cheese"]})
+    assert form.validate() == []
+
+
+def test_validate_novalidate_and_formnovalidate():
+    """The form's novalidate and the submitter's formnovalidate (which
+    takes precedence) both disable validation."""
+    text = """
+    <form novalidate>
+      <input type="text" name="login" required>
+      <input type="submit" name="save" value="Save">
+      <input type="submit" name="draft" value="Draft" formnovalidate>
+    </form>
+    """
+    form = parse_form(text)
+    assert form.validate() == []
+
+    text = text.replace(" novalidate>", ">")
+    form = parse_form(text)
+    assert len(form.validate()) == 1
+    form.choose_submit("draft")
+    assert form.validate() == []
+    form.choose_submit("save")
+    assert len(form.validate()) == 1
+
+
+def test_validate_does_not_modify_dom():
+    form = parse_form()
+    before = str(form.form)
+    form.validate()
+    assert str(form.form) == before
+
+
+def test_submit_validate_never_calls_adapter():
+    """With validate=True, a failed validation raises FormValidationError
+    carrying all violations, and the HTTP adapter is never asked to send
+    the form."""
+    browser, mock = prepare_mock_browser()
+    url = 'mock://form.com'
+    mock_get(mock, url, validate_form_html)
+    browser.open(url)
+    browser.select_form()
+
+    with pytest.raises(mechanicalsoup.FormValidationError) as excinfo:
+        browser.submit_selected(validate=True)
+    assert [(v.control.get("name"), v.constraint)
+            for v in excinfo.value.violations] == [
+        ("size", "valueMissing"),
+        ("legend_note", "valueMissing"),
+    ]
+    # Only the initial GET went through the adapter; no POST was sent.
+    assert [r.method for r in mock.request_history] == ["GET"]
+
+    # Fixing all problems in one pass lets the submission go through.
+    browser.form.set_radio({"size": "small"})
+    browser.form.set_input({"legend_note": "ok"})
+    # NB: mock_post compares parse_qsl output, which drops blank values.
+    mock_post(mock, url + '/post', [
+        ("size", "small"),
+        ("legend_note", "ok"),
+        ("save", "Save"),
+    ])
+    res = browser.submit_selected(validate=True)
+    assert res.status_code == 200
+    assert [r.method for r in mock.request_history] == ["GET", "POST"]
+
+
+def test_submit_validate_opt_in():
+    """Without validate=True, submission is not validated (default)."""
+    browser, url = setup_mock_browser(text=validate_form_html)
+    mock_get_called = browser.open(url)
+    assert mock_get_called.status_code == 200
+    browser.select_form()
+    # No POST handler registered: requests_mock raises NoMockAddress on
+    # any attempted request, proving validation did not run first.
+    with pytest.raises(Exception) as excinfo:
+        browser.submit_selected()
+    assert not isinstance(excinfo.value, mechanicalsoup.FormValidationError)
 
 
 if __name__ == '__main__':
