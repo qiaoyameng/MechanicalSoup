@@ -1,4 +1,5 @@
 import copy
+import io
 import json
 import os
 import re
@@ -409,36 +410,25 @@ def test_form_multiple():
     assert response.status_code == 200 and response.text == 'Success!'
 
 
-def test_upload_file(httpbin):
+def test_upload_file_not_recorded():
     browser = mechanicalsoup.StatefulBrowser()
-    url = httpbin + "/post"
-    file_input_form = f"""
-    <form method="post" action="{url}" enctype="multipart/form-data">
+    file_input_form = """
+    <form enctype="multipart/form-data">
         <input type="file" name="first" />
     </form>
     """
-
-    # Create two temporary files to upload
-    def make_file(content):
-        path = tempfile.mkstemp()[1]
-        with open(path, "w") as fd:
-            fd.write(content)
-        return path
-    path1 = make_file("first file content")
-    path2 = make_file("second file content")
-
     browser.open_fake_page(file_input_form)
     browser.select_form()
+    with pytest.raises(mechanicalsoup.UnsupportedFormEditError):
+        browser["first"] = "first file"
+    with pytest.raises(mechanicalsoup.UnsupportedFormEditError,
+                       match="file controls"):
+        browser.new_control("file", "second", "second file")
+    assert browser.export_form_edits()["edits"] == []
 
-    # Test filling an existing input and creating a new input
-    with open(path1, "rb") as value1, open(path2, "rb") as value2:
-        browser["first"] = value1
-        browser.new_control("file", "second", value2)
-        response = browser.submit_selected()
-
-    files = response.json()["files"]
-    assert files["first"] == "first file content"
-    assert files["second"] == "second file content"
+    with pytest.raises(mechanicalsoup.UnsupportedFormEditError):
+        browser["first"] = io.StringIO("file content")
+    assert browser.export_form_edits()["edits"] == []
 
 
 def test_upload_file_with_malicious_default(httpbin):
@@ -462,22 +452,27 @@ def test_upload_file_with_malicious_default(httpbin):
     assert response.json()["files"] == {"malicious": ""}
 
 
-def test_upload_file_raise_on_string_input():
-    """Check for use of the file upload API that was modified to remediate
-    CVE-2023-34457. Users must now open files manually to upload them.
-    """
+def test_file_and_hidden_edits_are_unsupported():
     browser = mechanicalsoup.StatefulBrowser()
-    file_input_form = """
-    <form enctype="multipart/form-data">
+    form_html = """
+    <form>
+        <input type="hidden" name="token" value="one" />
         <input type="file" name="upload" />
     </form>
     """
-    browser.open_fake_page(file_input_form)
+    browser.open_fake_page(form_html)
     browser.select_form()
-    with pytest.raises(ValueError, match="CVE-2023-34457"):
+    with pytest.raises(mechanicalsoup.UnsupportedFormEditError):
         browser["upload"] = "/path/to/file"
-    with pytest.raises(ValueError, match="CVE-2023-34457"):
+    with pytest.raises(mechanicalsoup.UnsupportedFormEditError):
+        browser["token"] = "two"
+    with pytest.raises(mechanicalsoup.UnsupportedFormEditError):
         browser.new_control("file", "upload2", "/path/to/file")
+    assert browser.export_form_edits()["edits"] == []
+
+    with pytest.raises(mechanicalsoup.UnsupportedFormEditError):
+        browser["upload"] = io.StringIO("file content")
+    assert browser.export_form_edits()["edits"] == []
 
 
 def test_with():

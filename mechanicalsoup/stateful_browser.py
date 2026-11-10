@@ -133,6 +133,50 @@ class StatefulBrowser(Browser):
         """
         self.form[name] = value
 
+    def set_input(self, data):
+        """Call :func:`Form.set_input` on the currently selected form."""
+        return self.form.set_input(data)
+
+    def set_textarea(self, data):
+        """Call :func:`Form.set_textarea` on the currently selected form."""
+        return self.form.set_textarea(data)
+
+    def set_checkbox(self, data, uncheck_other_boxes=True):
+        """Call :func:`Form.set_checkbox` on the currently selected form."""
+        return self.form.set_checkbox(data, uncheck_other_boxes)
+
+    def set_radio(self, data):
+        """Call :func:`Form.set_radio` on the currently selected form."""
+        return self.form.set_radio(data)
+
+    def set_select(self, data):
+        """Call :func:`Form.set_select` on the currently selected form."""
+        return self.form.set_select(data)
+
+    def check(self, data):
+        """Call :func:`Form.check` on the currently selected form."""
+        return self.form.check(data)
+
+    def uncheck_all(self, name):
+        """Call :func:`Form.uncheck_all` on the currently selected form."""
+        return self.form.uncheck_all(name)
+
+    def choose_submit(self, submit):
+        """Call :func:`Form.choose_submit` on the currently selected form."""
+        return self.form.choose_submit(submit)
+
+    def export_form_edits(self, as_json=False, **kwargs):
+        """Export edits from the currently selected form."""
+        return self.form.export_form_edits(as_json, **kwargs)
+
+    def load_form_edits(self, record):
+        """Load a form edit record into the currently selected form."""
+        return self.form.load_form_edits(record)
+
+    def apply_form_edits(self, record=None):
+        """Apply a form edit record to the currently selected form."""
+        return self.form.apply_form_edits(record)
+
     def new_control(self, type, name, value, **kwargs):
         """Call :func:`Form.new_control` on the currently selected form."""
         return self.form.new_control(type, name, value, **kwargs)
@@ -313,6 +357,8 @@ class StatefulBrowser(Browser):
         All other arguments are forwarded to :func:`Browser.submit`.
         """
         kwargs = self._merge_referer(**kwargs)
+        if btnName is not None:
+            self.form.choose_submit(btnName)
         resp = Browser.submit(
             self,
             form=self.form,
