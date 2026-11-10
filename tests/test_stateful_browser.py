@@ -14,6 +14,7 @@ from utils import (mock_get, open_legacy_httpbin, prepare_mock_browser,
 
 import mechanicalsoup
 import requests
+import requests_mock
 
 
 def test_request_forward():
@@ -918,6 +919,243 @@ def test_submit_error():
     browser.select_form()
     with pytest.raises(UserWarning, match="To submit a form"):
         browser.submit(browser.form)
+
+
+PARENT_PAGE = '''
+<html>
+  <body>
+    <a href="relative/page.html">relative link</a>
+    <form id="parent-form" method="post" action="parent-target">
+      <input type="text" name="parent_field" value="parent value" />
+    </form>
+    <iframe id="outer" src="/frames/outer.html"></iframe>
+  </body>
+</html>
+'''
+
+# The outer frame is loaded from a remote src; it contains an inner frame
+# that is defined entirely through srcdoc.
+OUTER_FRAME_PAGE = '''
+<html>
+  <body>
+    <iframe id="inner" srcdoc='<html><body>
+      <form id="frame-form" method="post" action="frame-target">
+        <input type="text" name="frame_field" value="frame value" />
+        <input type="submit" name="send" value="Send" />
+      </form>
+    </body></html>'></iframe>
+  </body>
+</html>
+'''
+
+
+def test_enter_frame_nested_submit_and_leave():
+    """Drive select_form/submit_selected through a remote-src outer frame and
+    a srcdoc inner frame, then leave and check the parent page is intact."""
+    base_url = "http://frame.example.com/"
+    outer_url = base_url + "frames/outer.html"
+
+    with requests_mock.Mocker() as mock:
+        mock.get(base_url, text=PARENT_PAGE,
+                 headers={'Content-Type': 'text/html'})
+        mock.get(outer_url, text=OUTER_FRAME_PAGE,
+                 headers={'Content-Type': 'text/html'})
+        # The srcdoc frame inherits the parent frame's base URL, so a
+        # relative action resolves against the outer frame's URL.
+        frame_target = base_url + "frames/frame-target"
+        mock.post(frame_target, text='<html><body>frame result</body></html>',
+                  headers={'Content-Type': 'text/html'})
+
+        browser = mechanicalsoup.StatefulBrowser()
+        browser.open(base_url)
+        browser.select_form("#parent-form")
+        assert browser.frame_depth == 0
+
+        # Enter the remote-src outer frame: its URL is the response URL.
+        browser.enter_frame("#outer")
+        assert browser.frame_depth == 1
+        assert browser.url == outer_url
+
+        # Enter the nested srcdoc frame: it inherits the parent base URL.
+        browser.enter_frame("#inner")
+        assert browser.frame_depth == 2
+        assert browser.url == outer_url
+        assert browser.page.find("form", id="frame-form") is not None
+
+        browser.select_form("#frame-form")
+        browser["frame_field"] = "updated frame value"
+        response = browser.submit_selected()
+        assert response.status_code == 200
+        assert browser.url == frame_target
+        # Navigation inside the frame only affects the frame level.
+        assert browser.frame_depth == 2
+
+        # Leaving twice restores the top-level page and its selected form.
+        browser.leave_frame()
+        assert browser.frame_depth == 1
+        assert browser.url == outer_url
+        browser.leave_frame()
+        assert browser.frame_depth == 0
+        assert browser.url == base_url
+
+        # The parent form selection (including filled values) survived.
+        parent_form = browser.get_current_form()
+        assert parent_form.form.get("id") == "parent-form"
+        assert parent_form.form.find("input",
+                                     attrs={"name": "parent_field"})[
+            "value"] == "parent value"
+
+        # Relative links on the parent page still resolve correctly.
+        link = browser.find_link(link_text="relative link")
+        assert browser.absolute_url(link["href"]) == \
+            base_url + "relative/page.html"
+
+
+def test_enter_frame_srcdoc_takes_precedence_over_src():
+    """srcdoc must win over src and inherit the parent base URL."""
+    browser = mechanicalsoup.StatefulBrowser()
+    browser.open_fake_page(
+        '<iframe id="f" src="http://other.example.com/ignored.html" '
+        "srcdoc='<html><body><a href=\"child.html\">x</a></body></html>'>"
+        "</iframe>",
+        url="http://frame.example.com/parent.html")
+
+    browser.enter_frame("#f")
+    assert browser.url == "http://frame.example.com/parent.html"
+    assert browser.find_link(link_text="x") is not None
+    assert browser.absolute_url("child.html") == \
+        "http://frame.example.com/child.html"
+
+
+def test_enter_frame_keeps_shared_session():
+    """All frame requests go through the original Session, so cookies set in
+    the parent page are still visible inside the frame (no disconnected
+    jar)."""
+    base_url = "http://frame.example.com/"
+    frame_url = base_url + "frame.html"
+    with requests_mock.Mocker() as mock:
+        mock.get(base_url, text='<iframe src="frame.html"></iframe>',
+                 headers={'Content-Type': 'text/html'})
+        frame_matcher = mock.get(
+            frame_url,
+            text='<html><body>frame</body></html>',
+            headers={'Content-Type': 'text/html'})
+
+        session = requests.Session()
+        # Seed the shared jar directly: the requests_mock adapter only
+        # populates response.cookies rather than the session jar.
+        requests.utils.add_dict_to_cookiejar(
+            session.cookies, {'session': 'abc123'})
+        browser = mechanicalsoup.StatefulBrowser(session=session)
+        browser.open(base_url)
+        browser.enter_frame()
+
+        assert browser.session is session
+        assert session.cookies.get("session") == "abc123"
+        sent_cookie = frame_matcher.last_request.headers.get("Cookie", "")
+        assert "session=abc123" in sent_cookie
+
+
+def test_enter_frame_failures_keep_context():
+    """Failed frame entry must not disturb the current browsing context."""
+    base_url = "http://frame.example.com/"
+
+    with requests_mock.Mocker() as mock:
+        mock.get(base_url, text='<iframe src="frame.html"></iframe>',
+                 headers={'Content-Type': 'text/html'})
+        mock.get(base_url + "frame.html",
+                 content=b"\x89PNG\r\n\x1a\n-binary-",
+                 headers={'Content-Type': 'image/png'})
+        mock.get(base_url + "missing.html", status_code=404,
+                 text="not found")
+
+        browser = mechanicalsoup.StatefulBrowser(raise_on_404=False)
+        browser.open(base_url)
+        browser.select_form  # sanity: parent page usable
+        original_page = browser.page
+
+        # No matching frame.
+        with pytest.raises(mechanicalsoup.LinkNotFoundError):
+            browser.enter_frame("#does-not-exist")
+        assert browser.frame_depth == 0
+        assert browser.page is original_page
+
+        # Non-HTML response.
+        with pytest.raises(mechanicalsoup.LinkNotFoundError):
+            browser.enter_frame()
+        assert browser.frame_depth == 0
+        assert browser.page is original_page
+
+        # Load error (404 with a mocked adapter still produces a response,
+        # which is non-HTML here).
+        browser.open_fake_page(
+            '<iframe src="missing.html"></iframe>', url=base_url)
+        with pytest.raises(mechanicalsoup.LinkNotFoundError):
+            browser.enter_frame()
+        assert browser.frame_depth == 0
+
+        # Frame without srcdoc or src.
+        browser.open_fake_page('<iframe></iframe>', url=base_url)
+        with pytest.raises(mechanicalsoup.LinkNotFoundError):
+            browser.enter_frame()
+        assert browser.frame_depth == 0
+
+        # Network failure while loading the frame keeps the context too.
+        browser.open_fake_page(
+            '<iframe src="broken.html"></iframe>', url=base_url)
+        mock.get(base_url + "broken.html",
+                 exc=requests.ConnectionError("connection refused"))
+        with pytest.raises(requests.ConnectionError):
+            browser.enter_frame()
+        assert browser.frame_depth == 0
+        assert browser.url == base_url
+
+
+def test_enter_frame_depth_limit():
+    """The nesting limit is enforced and leaves the context untouched."""
+    browser = mechanicalsoup.StatefulBrowser()
+    browser.open_fake_page(
+        '<iframe srcdoc="<html><body>level 1</body></html>"></iframe>',
+        url="http://frame.example.com/")
+
+    browser.enter_frame(max_depth=1)
+    assert browser.frame_depth == 1
+    with pytest.raises(mechanicalsoup.FrameDepthLimitError):
+        browser.enter_frame(max_depth=1)
+    assert browser.frame_depth == 1
+
+
+def test_leave_frame_without_frame():
+    browser = mechanicalsoup.StatefulBrowser()
+    browser.open_fake_page("<html></html>", url="http://frame.example.com/")
+    with pytest.raises(IndexError):
+        browser.leave_frame()
+
+
+def test_frame_navigation_does_not_affect_parent():
+    """A link followed inside a frame replaces only the frame's state."""
+    base_url = "http://frame.example.com/"
+    with requests_mock.Mocker() as mock:
+        mock.get(base_url,
+                 text='<iframe src="frame.html"></iframe>',
+                 headers={'Content-Type': 'text/html'})
+        mock.get(base_url + "frame.html",
+                 text='<a href="frame-2.html">next</a>',
+                 headers={'Content-Type': 'text/html'})
+        mock.get(base_url + "frame-2.html",
+                 text='<html><body>second frame page</body></html>',
+                 headers={'Content-Type': 'text/html'})
+
+        browser = mechanicalsoup.StatefulBrowser()
+        browser.open(base_url)
+        browser.enter_frame()
+        browser.follow_link(link_text="next")
+        assert browser.url == base_url + "frame-2.html"
+        assert browser.frame_depth == 1
+
+        browser.leave_frame()
+        assert browser.frame_depth == 0
+        assert browser.url == base_url
 
 
 if __name__ == '__main__':

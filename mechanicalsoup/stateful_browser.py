@@ -21,6 +21,14 @@ class _BrowserState:
     request: requests.PreparedRequest | None = None
 
 
+class FrameDepthLimitError(LinkNotFoundError):
+    """Raised by :func:`StatefulBrowser.enter_frame` when the frame nesting
+    limit would be exceeded. It inherits from :class:`LinkNotFoundError`, so
+    callers catching either exception keep working.
+    """
+    pass
+
+
 class StatefulBrowser(Browser):
     """An extension of :class:`Browser` that stores the browser's state
     and provides many convenient functions for interacting with HTML elements.
@@ -73,6 +81,10 @@ class StatefulBrowser(Browser):
         self.__debug = False
         self.__verbose = 0
         self.__state = _BrowserState()
+        # Stack of saved parent states. The bottom element is the state of
+        # the top-level page; each entered frame pushes the state of the page
+        # containing it. ``self.__state`` always mirrors the top of the stack.
+        self.__frame_stack: list[_BrowserState] = []
 
         # Aliases for backwards compatibility
         # (Included specifically in __init__ to suppress them in Sphinx docs)
@@ -119,6 +131,21 @@ class StatefulBrowser(Browser):
         return self.__state.url
 
     @property
+    def frame_depth(self):
+        """Number of frames currently entered through :func:`enter_frame`.
+        Zero means the top-level page is active.
+        """
+        return len(self.__frame_stack)
+
+    def _replace_state(self, state):
+        """Set the state of the current browsing level.
+
+        Navigation inside an entered frame only replaces that frame's state;
+        the parent states saved on the frame stack are untouched.
+        """
+        self.__state = state
+
+    @property
     def form(self):
         """Get the currently selected form as a :class:`Form` object.
         See :func:`select_form`.
@@ -163,8 +190,8 @@ class StatefulBrowser(Browser):
             print(url)
 
         resp = self.get(url, *args, **kwargs)
-        self.__state = _BrowserState(page=resp.soup, url=resp.url,
-                                     request=resp.request)
+        self._replace_state(
+            _BrowserState(page=resp.soup, url=resp.url, request=resp.request))
         return resp
 
     def open_fake_page(self, page_text, url=None, soup_config=None):
@@ -175,9 +202,9 @@ class StatefulBrowser(Browser):
         URL. Useful mainly for testing.
         """
         soup_config = soup_config or self.soup_config
-        self.__state = _BrowserState(
+        self._replace_state(_BrowserState(
             page=bs4.BeautifulSoup(page_text, **soup_config),
-            url=url)
+            url=url))
 
     def open_relative(self, url, *args, **kwargs) -> ResponseWithSoup:
         """Like :func:`open`, but ``url`` can be relative to the currently
@@ -202,9 +229,115 @@ class StatefulBrowser(Browser):
 
         resp = self.session.send(old_request)
         resp = Browser.add_soup(resp, self.soup_config)
-        self.__state = _BrowserState(page=resp.soup, url=resp.url,
-                                     request=resp.request)
+        self._replace_state(
+            _BrowserState(page=resp.soup, url=resp.url,
+                          request=resp.request))
         return resp
+
+    def enter_frame(self, selector="iframe", nr=0, max_depth=10):
+        """Enter a frame (``<iframe>`` or ``<frame>``) of the current page.
+
+        The content of the frame becomes the current page, so that
+        :func:`select_form`, :func:`follow_link`, :func:`submit_selected`
+        and the other page-level functions operate inside the frame. Frames
+        can be entered recursively to reach nested frames. Use
+        :func:`leave_frame` to return to the enclosing page, which restores
+        its page and selected form exactly as they were.
+
+        Only static, parseable HTML is supported: no script is ever executed.
+
+        Per the HTML specification, a frame carrying a ``srcdoc`` attribute
+        is rendered from that attribute and its ``src`` is ignored; the
+        frame inherits the base URL (the current page's URL) of its parent.
+        Otherwise, the frame is loaded through the browser's existing
+        :class:`requests.Session` from the URL in ``src`` (resolved against
+        the current URL), and the final response URL becomes the frame's URL.
+
+        :param selector: CSS selector or a bs4.element.Tag identifying the
+            frame to enter. Defaults to ``"iframe"``. As in
+            :func:`select_form`, a :class:`~bs4.element.Tag` can be passed
+            directly.
+        :param nr: Zero-based index of the frame to use when several match
+            ``selector``.
+        :param max_depth: Maximum number of frames that may be nested.
+
+        :raises AttributeError: No page is currently loaded.
+        :raises LinkNotFoundError: No frame matches ``selector``/``nr``; the
+            frame has neither a usable ``srcdoc`` nor ``src``; the response
+            is not HTML (or could not be loaded as HTML); or the nesting
+            limit is exceeded (as :class:`FrameDepthLimitError`). In all
+            these cases the previous browsing context is left unchanged.
+        """
+        if self.frame_depth >= max_depth:
+            raise FrameDepthLimitError(
+                f"Refusing to enter a frame nested more than {max_depth} "
+                "levels deep.")
+
+        if self.page is None:
+            raise AttributeError(
+                "No page has been opened yet on this browser, or the last "
+                "response was not parsed as a page (e.g. it was not HTML)."
+            )
+
+        if isinstance(selector, bs4.element.Tag):
+            frame = selector
+            if frame.name not in ("iframe", "frame"):
+                raise LinkNotFoundError(
+                    "The selected tag is not an <iframe> or <frame>.")
+        else:
+            found_frames = self.page.select(selector, limit=nr + 1)
+            if len(found_frames) != nr + 1:
+                if self.__debug:
+                    print('enter_frame failed for', selector)
+                    self.launch_browser()
+                raise LinkNotFoundError()
+            frame = found_frames[-1]
+
+        # Build the new state before touching the current one, so that any
+        # failure leaves the existing browsing context intact.
+        frame_state = self._load_frame_state(frame)
+
+        self.__frame_stack.append(self.__state)
+        self._replace_state(frame_state)
+
+    def _load_frame_state(self, frame):
+        """Build the :class:`_BrowserState` for an entered frame tag."""
+        if frame.has_attr("srcdoc"):
+            # srcdoc takes precedence over src per the HTML specification
+            # and inherits the parent page's base URL.
+            return _BrowserState(
+                page=bs4.BeautifulSoup(frame["srcdoc"], **self.soup_config),
+                url=self.url)
+
+        src = frame.get("src")
+        if not src:
+            raise LinkNotFoundError(
+                "The frame has neither a 'srcdoc' nor a 'src' attribute.")
+
+        frame_url = self.absolute_url(src)
+        resp = self.get(frame_url)
+        if resp.soup is None:
+            raise LinkNotFoundError(
+                f"The frame at {frame_url} did not return parseable HTML.")
+
+        return _BrowserState(page=resp.soup, url=resp.url,
+                             request=resp.request)
+
+    def leave_frame(self):
+        """Leave the current frame and return to its parent page.
+
+        The parent page's URL, parsed document and selected form are restored
+        exactly as they were when :func:`enter_frame` was called, including
+        any values filled into the form. Navigation performed inside the
+        frame is discarded.
+
+        :raises IndexError: No frame has been entered, i.e. the top-level
+            page is already active.
+        """
+        if not self.__frame_stack:
+            raise IndexError("No frame to leave: already on the top-level "
+                             "page.")
+        self._replace_state(self.__frame_stack.pop())
 
     def select_form(self, selector="form", nr=0):
         """Select a form in the current page.
@@ -321,8 +454,9 @@ class StatefulBrowser(Browser):
             **kwargs,
         )
         if update_state:
-            self.__state = _BrowserState(page=resp.soup, url=resp.url,
-                                         request=resp.request)
+            self._replace_state(
+                _BrowserState(page=resp.soup, url=resp.url,
+                              request=resp.request))
         return resp
 
     def list_links(self, *args, **kwargs):

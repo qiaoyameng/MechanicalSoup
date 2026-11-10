@@ -16,6 +16,14 @@ Version 1.5 (in development)
 * ``StatefulBrowser.links`` now raises an explanatory ``AttributeError`` when
   no page is loaded, instead of failing inside BeautifulSoup.
 
+* Added ``StatefulBrowser.enter_frame`` and ``StatefulBrowser.leave_frame``
+  to navigate static, nested ``<iframe>``/``<frame>`` documents. ``srcdoc``
+  takes precedence over ``src`` per the HTML specification and inherits the
+  parent page's base URL, while a remote ``src`` is loaded with the browser's
+  existing ``requests.Session`` and uses the final response URL. Each frame
+  keeps its own page and selected form; leaving a frame restores the parent
+  context, and navigation inside a frame only affects that frame.
+
 Version 1.4
 ===========
 
